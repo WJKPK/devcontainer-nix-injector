@@ -5,21 +5,18 @@ import subprocess
 import re
 import typer
 import click
+import shlex
 from pathlib import Path
 
 app = typer.Typer(
-    help="Devcontainer Nix Injector (dni) - Tool for managing devcontainers with Nix"
+    help="Devcontainer Nix Injector (dni) - Tool for injecting devcontainers with Nix configs"
 )
-
 
 def run_command(
     cmd: List[str], show_output: bool = True
 ) -> subprocess.CompletedProcess:
     """Run a shell command and optionally show its output."""
-    if show_output:
-        return subprocess.run(cmd)
-    else:
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return subprocess.run(cmd, check=False, capture_output=not show_output, text=True)
 
 
 def devcontainer_exec(
@@ -42,13 +39,12 @@ def command_in_container_available(workspace_folder: str, command: str) -> bool:
         "devcontainer",
         "exec",
         "--workspace-folder",
-        workspace_folder,
+        str(workspace_folder),
         "bash",
         "-c",
-        "command -v",
-        command,
+        f"command -v {shlex.quote(command)}",
     ]
-    return 0 == run_command(cmd).returncode
+    return run_command(cmd, show_output=False).returncode == 0
 
 
 def start_devcontainer(workspace_dir: Path, purge: bool) -> subprocess.CompletedProcess:
@@ -123,7 +119,7 @@ def setup_devcontainer(
     ),
     config: str = typer.Option(..., help="Config name to apply"),
     purge: bool = typer.Option(False, "--purge", help="Purge existing docker instance"),
-):
+) -> None:
     """Set up a devcontainer with Nix, home-manager and personal configurations."""
 
     if start_devcontainer(workspace_dir, purge).returncode:
@@ -137,8 +133,10 @@ def setup_devcontainer(
         typer.echo("System doesn't contain supported package manager!")
         return
 
+    deps_to_install = "curl"
+    if not command_in_container_available(workspace_dir, deps_to_install):
         devcontainer_exec(
-            workspace_dir, "sudo apt update && sudo apt install -y curl git"
+            workspace_dir, f"sudo apt update && sudo apt install -y {deps_to_install}"
         ).check_returncode()
 
     if not command_in_container_available(workspace_dir, "nix"):
@@ -156,15 +154,24 @@ def setup_devcontainer(
 
         devcontainer_exec(
             workspace_dir,
-            "nix-channel --add https://github.com/nix-community/home-manager/archive/master.tar.gz home-manager && "
-            + "nix-channel --update && nix-shell '<home-manager>' -A install",
+            "nix-channel --add https://github.com/nix-community/home-manager/archive/master.tar.gz home-manager &> /dev/null "
+            + "nix-channel --update && nix-shell '<home-manager>' -A install &> /dev/null",
         ).check_returncode()
 
     typer.echo("Applying personal configuration...")
 
-    formatted_nix_input = repo if repo is not None else "github:" + github
-    command = f"nix run --inputs-from {formatted_nix_input} home-manager -- switch --flake {formatted_nix_input}#{config}"
-    devcontainer_exec(workspace_dir, command)
+    formatted_nix_input = f"github:{github}" if github else repo
+    nix_env = {
+        "NIX_CONFIG": "experimental-features = nix-command flakes"
+    }
+    
+    command = (
+        f"nix run --inputs-from {formatted_nix_input} home-manager -- "
+        f"switch --flake {formatted_nix_input}#{config} -b backup"
+    )
+    
+    # Execute the command with the environment variable
+    devcontainer_exec(workspace_dir, command, remote_env=nix_env).check_returncode()
 
     typer.echo("Devcontainer setup completed successfully!")
 
