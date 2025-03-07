@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 
-from typing import Optional, List
 import subprocess
 import re
 import typer
 import click
 import shlex
 from pathlib import Path
+from typer import Context, CallbackParam
 
 app = typer.Typer(
     help="Devcontainer Nix Injector (dni) - Tool for injecting devcontainers with Nix configs"
 )
 
-def run_command(
-    cmd: List[str], show_output: bool = True
-) -> subprocess.CompletedProcess:
+
+def run_command(cmd: list[str], show_output: bool = True) -> subprocess.CompletedProcess[str]:
     """Run a shell command and optionally show its output."""
     return subprocess.run(cmd, check=False, capture_output=not show_output, text=True)
 
 
 def devcontainer_exec(
-    workspace_folder: str, command: str, remote_env: Optional[dict] = None
-) -> subprocess.CompletedProcess:
+    workspace_folder: Path, command: str, remote_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     """Execute a command in the devcontainer."""
-    cmd = ["devcontainer", "exec", "--workspace-folder", workspace_folder]
+    cmd = ["devcontainer", "exec", "--workspace-folder", str(workspace_folder)]
 
     if remote_env:
         for key, value in remote_env.items():
@@ -33,7 +32,7 @@ def devcontainer_exec(
     return run_command(cmd)
 
 
-def command_in_container_available(workspace_folder: str, command: str) -> bool:
+def command_in_container_available(workspace_folder: Path, command: str) -> bool:
     """Check that programm is available in container."""
     cmd = [
         "devcontainer",
@@ -47,49 +46,64 @@ def command_in_container_available(workspace_folder: str, command: str) -> bool:
     return run_command(cmd, show_output=False).returncode == 0
 
 
-def start_devcontainer(workspace_dir: Path, purge: bool) -> subprocess.CompletedProcess:
+def start_devcontainer(workspace_dir: Path, purge: bool) -> subprocess.CompletedProcess[str]:
     typer.echo(f"Starting devcontainer in {workspace_dir}...")
 
     cmd = ["devcontainer", "up"]
-    cmd.extend(["--workspace-folder", workspace_dir])
+    cmd.extend(["--workspace-folder", str(workspace_dir)])
     if purge:
         cmd.extend(["--remove-existing-container"])
 
     return run_command(cmd)
 
 
-def validate_url(value: str) -> str:
+def validate_url(value: str | None) -> str | None:
     if value is None:
-        return None
+        return value
+
     url_pattern = re.compile(r"^https?://[\w\-\.]+\.[a-z]{2,}(/.*)?$")
     if not url_pattern.match(value):
         raise typer.BadParameter(f"Invalid URL: {value}")
     return value
 
 
-def validate_github(value: str) -> str:
+def validate_github(value: str | None ) -> str | None:
     if value is None:
-        return None
+        return value
+
     github_pattern = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
     if not github_pattern.match(value):
-        raise typer.BadParameter(
-            "Invalid GitHub repo format. Use format: username/repo"
-        )
+        raise typer.BadParameter("Invalid GitHub repo format. Use format: username/repo")
     return value
 
 
-def validate_sources(ctx: typer.Context, param: click.Parameter, value: str) -> str:
+def validate_sources(ctx: typer.Context, param: click.Parameter, value: str| None) -> str | None:
     other_param = "github" if param.name == "repo" else "repo"
     other_value = ctx.params.get(other_param)
 
     if value is not None and other_value is not None:
         raise typer.BadParameter("Cannot specify both --repo and --github")
 
-    if param.name == "github" and value is None and ctx.params.get("repo") is None:
+    if other_value is None and value is None:
         raise typer.BadParameter("Must specify either --repo or --github")
 
     return value
 
+def validate_repo_callback(
+    ctx: Context, 
+    param: CallbackParam, 
+    value: str | None
+) -> str | None:
+    """Callback for repo URL validation"""
+    return validate_sources(ctx, param, validate_url(value))
+
+def validate_github_callback(
+    ctx: Context,
+    param: CallbackParam,
+    value: str | None
+) -> str | None:
+    """Callback for GitHub repo format validation"""
+    return validate_sources(ctx, param, validate_github(value))
 
 @app.command("setup")
 def setup_devcontainer(
@@ -99,22 +113,18 @@ def setup_devcontainer(
         file_okay=False,
         help="Work directory containing devcontainer",
     ),
-    repo: Optional[str] = typer.Option(
+    repo: str | None = typer.Option(
         None,
         "--repo",
         "-r",
-        callback=lambda ctx, param, value: validate_sources(
-            ctx, param, validate_url(value)
-        ),
+        callback= validate_repo_callback,
         help="URL to the repository",
     ),
-    github: Optional[str] = typer.Option(
+    github: str | None = typer.Option(
         None,
         "--github",
         "-g",
-        callback=lambda ctx, param, value: validate_sources(
-            ctx, param, validate_github(value)
-        ),
+        callback = validate_github_callback,
         help="GitHub repo in format username/repo",
     ),
     config: str = typer.Option(..., help="Config name to apply"),
@@ -155,21 +165,19 @@ def setup_devcontainer(
         devcontainer_exec(
             workspace_dir,
             "nix-channel --add https://github.com/nix-community/home-manager/archive/master.tar.gz home-manager &> /dev/null "
-            + "nix-channel --update && nix-shell '<home-manager>' -A install &> /dev/null",
+            + "&& nix-channel --update && nix-shell '<home-manager>' -A install &> /dev/null",
         ).check_returncode()
 
     typer.echo("Applying personal configuration...")
 
     formatted_nix_input = f"github:{github}" if github else repo
-    nix_env = {
-        "NIX_CONFIG": "experimental-features = nix-command flakes"
-    }
-    
+    nix_env = {"NIX_CONFIG": "experimental-features = nix-command flakes"}
+
     command = (
         f"nix run --inputs-from {formatted_nix_input} home-manager -- "
         f"switch --flake {formatted_nix_input}#{config} -b backup"
     )
-    
+
     # Execute the command with the environment variable
     devcontainer_exec(workspace_dir, command, remote_env=nix_env).check_returncode()
 
@@ -188,7 +196,7 @@ def shell_devcontainer(
     """Open an interactive shell in the devcontainer"""
     typer.echo(f"Opening shell in devcontainer at {workspace_dir}...")
 
-    cmd = ["devcontainer", "exec", "--workspace-folder", workspace_dir, "zsh", "-i"]
+    cmd = ["devcontainer", "exec", "--workspace-folder", str(workspace_dir), "zsh", "-i"]
     if run_command(cmd).returncode:
         typer.echo("Failed to run shell in container!")
 
